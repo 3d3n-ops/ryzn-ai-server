@@ -1,0 +1,8 @@
+python-dotenv==1.0.1
+fastapi==0.109.2
+uvicorn==0.27.1
+python-multipart==0.0.9
+pytesseract==0.3.10
+pdf2image==1.17.0
+langchain-openai==0.0.5
+gTTS==2.5.1 
