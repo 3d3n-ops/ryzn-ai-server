@@ -1,36 +1,109 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Ryzn Notes Backend
 
-## Getting Started
+A FastAPI backend for document processing, summarization, and audio generation.
 
-First, run the development server:
+## Features
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+- Document text extraction (PDF, TXT)
+- AI-powered document summarization
+- Notes generation in markdown format
+- Quiz generation from document content
+- Text-to-speech conversion
+- Audio transcription
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Requirements
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- Python 3.8+
+- FFmpeg
+- Poppler
+- Tesseract OCR
+- Google Cloud credentials
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Setup
 
-## Learn More
+1. Clone the repository:
 
-To learn more about Next.js, take a look at the following resources:
+   ```
+   git clone https://github.com/yourusername/ryzn-notes.git
+   cd ryzn-notes
+   ```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+2. Create and activate a virtual environment:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+   ```
+   cd src/app/backend
+   python -m venv venv
 
-## Deploy on Vercel
+   # Windows
+   .\venv\Scripts\activate
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+   # Linux/Mac
+   source venv/bin/activate
+   ```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+3. Install dependencies:
+
+   ```
+   pip install -r requirements.txt
+   ```
+
+4. Set up environment variables:
+   Create a `.env` file in the `src/app/backend` directory with the following variables:
+
+   ```
+   GROQ_API_KEY=your_groq_api_key
+   GOOGLE_APPLICATION_CREDENTIALS=path_to_google_credentials.json
+   ```
+
+5. Install system dependencies:
+
+   - Tesseract OCR (for Windows: https://github.com/UB-Mannheim/tesseract/wiki)
+   - Poppler (for Windows: https://github.com/oschwartz10612/poppler-windows/releases/)
+   - FFmpeg (for Windows: https://ffmpeg.org/download.html)
+
+6. Update paths in `main.py` if necessary:
+   - Tesseract path
+   - Poppler path
+   - FFmpeg path
+
+## Deployment
+
+1. Create required directories:
+
+   ```
+   mkdir -p uploads static cache credentials
+   ```
+
+2. Place your Google Cloud credentials in the credentials directory:
+
+   ```
+   cp path/to/your/google-credentials.json credentials/
+   ```
+
+3. Start the server:
+
+   ```
+   uvicorn src.app.backend.main:app --host 0.0.0.0 --port 8000
+   ```
+
+4. For production deployment, consider using a process manager like Gunicorn:
+   ```
+   pip install gunicorn
+   gunicorn -w 4 -k uvicorn.workers.UvicornWorker src.app.backend.main:app
+   ```
+
+## API Endpoints
+
+- `POST /api/summarize`: Summarize a document (PDF, TXT)
+- `POST /api/response`: Generate a response to a user query about a document
+- `POST /api/transcribe`: Transcribe an audio file
+
+## Development
+
+- To run tests: `pytest`
+- To check code quality: `flake8`
+- To format code: `black src/`
+
+## License
+
+[MIT](LICENSE)

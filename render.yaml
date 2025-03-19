@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ryzn-notes-api
+    env: python
+    buildCommand: pip install -r src/app/backend/requirements.txt
+    startCommand: ./start.sh
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.0
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/google-credentials.json
+    secrets:
+      - name: google-credentials
+        mountPath: /etc/secrets

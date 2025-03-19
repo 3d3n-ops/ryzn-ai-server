@@ -10,7 +10,7 @@ router = APIRouter()
 # CORS middleware to allow requests from the Next.js frontend
 router.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Update with your frontend URL
+    allow_origins=["http://localhost:3000", "https://rzn-ai.vercel.app/", "https://rzn-ai-edens-projects-571d2f34.vercel.app/", "https://rzn-ai-git-main-edens-projects-571d2f34.vercel.app/"],  # Update with your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

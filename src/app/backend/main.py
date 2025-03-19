@@ -6,18 +6,22 @@ import os
 import shutil
 import uuid
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 import pytesseract
 from pdf2image import convert_from_path
-from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
 from gtts import gTTS
 from dotenv import load_dotenv
-import whisper  # OpenAI Whisper package
+import whisper
 from google.cloud import texttospeech
 from pathlib import Path
 import re
 from pydub import AudioSegment
+import time
+import json
+import hashlib
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -26,6 +30,37 @@ logger = logging.getLogger(__name__)
 # Load environment variables first
 load_dotenv()
 
+# Set up caching
+CACHE_DIR = Path("cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+def get_cache_key(file_content: str, output_type: str) -> str:
+    """Generate a unique cache key based on file content and output type."""
+    content_hash = hashlib.md5(file_content.encode()).hexdigest()
+    return f"{content_hash}_{output_type}"
+
+def get_cached_response(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Retrieve cached response if it exists."""
+    cache_file = CACHE_DIR / f"{cache_key}.json"
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                cached_data = json.load(f)
+                logger.debug(f"Cache hit for key: {cache_key}")
+                return cached_data
+        except Exception as e:
+            logger.error(f"Error reading cache: {str(e)}")
+    return None
+
+def cache_response(cache_key: str, response_data: Dict[str, Any]) -> None:
+    """Cache the response data."""
+    try:
+        cache_file = CACHE_DIR / f"{cache_key}.json"
+        with open(cache_file, 'w') as f:
+            json.dump(response_data, f)
+        logger.debug(f"Cached response for key: {cache_key}")
+    except Exception as e:
+        logger.error(f"Error caching response: {str(e)}")
 
 ## These are neccesary paths and configurations for the app to run. Tesseract helps with extracting the text from the file, 
 ## Poppler helps with converting the PDF to images, and FFmpeg helps with combining the audio files.
@@ -42,7 +77,7 @@ CREDENTIALS_DIR.mkdir(exist_ok=True)
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("static", exist_ok=True)
 
-# Set paths for Windows
+# Set paths for different operating systems
 if os.name == 'nt':  # Windows
     # Tesseract configuration
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
@@ -57,7 +92,7 @@ if os.name == 'nt':  # Windows
         raise RuntimeError(f"Poppler not found at {POPPLER_PATH}. Please install Poppler and ensure it's in the correct location.")
 
     # FFmpeg configuration
-    FFMPEG_PATH = r"C:\Users\3d3n2\Downloads\ffmpeg-master-latest-win64-gpl-shared\ffmpeg-master-latest-win64-gpl-shared\bin"  # Update this path to where you installed FFmpeg
+    FFMPEG_PATH = r"C:\Users\3d3n2\Downloads\ffmpeg-master-latest-win64-gpl-shared\ffmpeg-master-latest-win64-gpl-shared\bin"
     if not os.path.exists(FFMPEG_PATH):
         logger.error(f"FFmpeg not found at {FFMPEG_PATH}")
         raise RuntimeError(f"FFmpeg not found at {FFMPEG_PATH}. Please install FFmpeg and ensure it's in the correct location.")
@@ -65,6 +100,9 @@ if os.name == 'nt':  # Windows
     # Add FFmpeg to system PATH for pydub
     if FFMPEG_PATH not in os.environ['PATH']:
         os.environ['PATH'] += os.pathsep + FFMPEG_PATH
+else:  # Linux/MacOS (deployment environment)
+    # For Linux deployment, these binaries are installed via apt-get in start.sh
+    pass
 
 # Verify Google Cloud credentials
 google_creds_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
@@ -76,7 +114,8 @@ if not google_creds_path:
 if not os.path.isabs(google_creds_path):
     google_creds_path = str(BASE_DIR / google_creds_path)
 
-if not os.path.exists(google_creds_path):
+# Only check for credentials file in development mode
+if os.environ.get('RENDER') != 'true' and not os.path.exists(google_creds_path):
     logger.error(f"Google Cloud credentials file not found at: {google_creds_path}")
     logger.error(f"Please place your google-credentials.json file in: {CREDENTIALS_DIR}")
     raise RuntimeError(f"Google Cloud credentials file not found. Please place your google-credentials.json file in: {CREDENTIALS_DIR}")
@@ -87,10 +126,13 @@ logger.debug(f"Using Google Cloud credentials from: {google_creds_path}")
 
 app = FastAPI()
 
-# CORS middleware to allow requests from the Next.js frontend
+# Get the list of allowed origins from environment or use default
+allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+
+# CORS middleware to allow requests from the frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Update with your frontend URL
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -99,12 +141,21 @@ app.add_middleware(
 # Mount static directory for serving audio files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Initialize LLM
-llm = ChatOpenAI(
-    model_name="gpt-3.5-turbo",
+# Initialize LLM with Groq
+groq_api_key = os.getenv("GROQ_API_KEY")
+if not groq_api_key:
+    raise ValueError("GROQ_API_KEY environment variable is not set")
+
+llm = ChatGroq(
+    model_name="mixtral-8x7b-32768",  # Using Mixtral model from Groq
     temperature=0.7,
-    api_key=os.getenv("OPENAI_API_KEY")
+    api_key=groq_api_key,
+    streaming=False
 )
+
+# Add debug logging for API key
+logger.debug(f"Using Groq API key: {groq_api_key[:8]}...")  # Only log first 8 chars for security
+
 class ChatResponse(BaseModel):
     response: str
     user_query: str
@@ -119,8 +170,37 @@ class SummaryResponse(BaseModel):
     notes: Optional[str] = None
     tts_audio_url: Optional[str] = None
     transcript: Optional[str] = None
-    quiz: Optional[str] = None
+    quiz: Optional[Dict[str, Any]] = None
 
+# Add a simple rate limiter
+class RateLimiter:
+    def __init__(self, max_calls=5, time_period=60):
+        self.max_calls = max_calls
+        self.time_period = time_period
+        self.calls = []
+        self.lock = False
+    
+    def can_call(self):
+        current_time = time.time()
+        # Remove old calls
+        self.calls = [call_time for call_time in self.calls if current_time - call_time < self.time_period]
+        
+        # Check if we can make a new call
+        if len(self.calls) < self.max_calls and not self.lock:
+            self.calls.append(current_time)
+            return True
+        return False
+    
+    def add_cooldown(self, seconds=10):
+        """Add a cooldown period where no calls are allowed"""
+        self.lock = True
+        threading.Timer(seconds, self._release_lock).start()
+    
+    def _release_lock(self):
+        self.lock = False
+
+# Create rate limiter for Groq API
+groq_limiter = RateLimiter(max_calls=12, time_period=86400)  # 182 calls per day
 
 ## This is the code for the summarize feature. User upload file and it will generate a summary of the file.
 ## The user can have a text summary of a file or an audio summary of a file.
@@ -163,12 +243,20 @@ async def summarize_document(
         logger.debug(f"Saving uploaded file to {file_path}")
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+            
         # Extract text from file
         logger.debug("Starting text extraction")
         text = extract_text(file_path)
         if not text.strip():
             raise HTTPException(status_code=400, detail="No text could be extracted from the file.")
         logger.debug(f"Extracted text length: {len(text)}")
+        
+        # Check cache first
+        cache_key = get_cache_key(text, output_type)
+        cached_response = get_cached_response(cache_key)
+        if cached_response:
+            logger.debug("Using cached response")
+            return SummaryResponse(**cached_response)
         
         # Generate summary
         logger.debug("Generating summary")
@@ -214,7 +302,19 @@ async def summarize_document(
                 logger.error(f"Error generating audio: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Error generating audio: {str(e)}")
         
-        return SummaryResponse(summary=summary, audio_url=audio_url, notes=notes, tts_audio_url=tts_audio_url, quiz=quiz)
+        # Create response object
+        response_data = {
+            "summary": summary,
+            "audio_url": audio_url,
+            "notes": notes,
+            "tts_audio_url": tts_audio_url,
+            "quiz": quiz
+        }
+        
+        # Cache the response
+        cache_response(cache_key, response_data)
+        
+        return SummaryResponse(**response_data)
     
     except Exception as e:
         logger.error(f"Error processing file: {str(e)}", exc_info=True)
@@ -314,32 +414,215 @@ def extract_from_pdf(file_path):
         logger.error(f"Error in extract_from_pdf: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-def generate_summary(text):
-    # Use LLM to generate summary
-    # Truncate text to avoid token limits
-    truncated_text = text[:4000]
-    prompt = f"Summarize the following text in a concise and informative way: {truncated_text}"
+def chunk_text(text: str, max_chunk_size: int = 2000) -> List[str]:
+    """Split text into smaller chunks while preserving sentence boundaries."""
+    sentences = text.split('.')
+    chunks = []
+    current_chunk = []
+    current_size = 0
     
+    for sentence in sentences:
+        sentence = sentence.strip() + '.'
+        sentence_size = len(sentence)
+        
+        if current_size + sentence_size > max_chunk_size and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = []
+            current_size = 0
+        
+        current_chunk.append(sentence)
+        current_size += sentence_size
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    return chunks
+
+def generate_summary(text):
     try:
-        logger.debug("Sending request to OpenAI")
-        response = llm.invoke(prompt)
-        return response.content
+        chunks = chunk_text(text)
+        summaries = []
+        
+        # Check cache for summaries
+        cache_key = get_cache_key(text, "summary")
+        cached_summary = get_cached_response(cache_key)
+        if cached_summary:
+            logger.debug("Using cached summary")
+            return cached_summary.get("summary", "")
+        
+        for chunk in chunks:
+            try:
+                # Check if we're within rate limits
+                if not groq_limiter.can_call():
+                    logger.warning("Rate limit reached, waiting before making API call")
+                    time.sleep(20)  # Wait 20 seconds when rate limited
+                
+                prompt = f"""Please provide a concise summary of the following text:
+
+                {chunk}
+
+                Focus on the main points and key takeaways. Be direct and concise."""
+                
+                logger.debug(f"Generating summary for chunk of size {len(chunk)}")
+                response = llm.invoke(prompt)
+                
+                # Handle Groq's response format
+                if hasattr(response, 'content'):
+                    summaries.append(response.content)
+                else:
+                    summaries.append(str(response))
+                    
+                # Prevent rate limit issues by adding delay between calls
+                time.sleep(3)
+                
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error processing chunk: {error_msg}")
+                
+                # Check for rate limit errors
+                if "429" in error_msg or "Too Many Requests" in error_msg:
+                    logger.warning("Rate limit hit, adding cooldown")
+                    groq_limiter.add_cooldown(30)  # 30 second cooldown
+                    time.sleep(30)
+                
+                raise HTTPException(status_code=500, detail=f"Error generating summary: {error_msg}")
+        
+        # Combine summaries
+        if len(summaries) > 1:
+            try:
+                # Check if we're within rate limits
+                if not groq_limiter.can_call():
+                    logger.warning("Rate limit reached for final summary, using first chunk summary")
+                    final_summary = summaries[0]
+                else:
+                    final_prompt = f"""Please provide a concise final summary combining these summaries:
+
+                    {' '.join(summaries)}
+
+                    Focus on the main points and key takeaways. Be direct and concise."""
+                    
+                    final_response = llm.invoke(final_prompt)
+                    
+                    # Handle Groq's response format
+                    if hasattr(final_response, 'content'):
+                        final_summary = final_response.content
+                    else:
+                        final_summary = str(final_response)
+                
+                # Cache the result
+                cache_response(cache_key, {"summary": final_summary})
+                return final_summary
+                    
+            except Exception as e:
+                logger.error(f"Error combining summaries: {str(e)}")
+                # If combining fails, return the first summary
+                return summaries[0]
+        else:
+            # Cache the result
+            cache_response(cache_key, {"summary": summaries[0]})
+            return summaries[0]
+            
     except Exception as e:
         logger.error(f"Error generating summary: {str(e)}")
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail=f"Error generating summary: {str(e)}")
 
 def generate_quiz(text):
-    # Use LLM to generate summary
+    # Check cache first for this specific text and quiz
+    cache_key = get_cache_key(text, "quiz")
+    cached_quiz = get_cached_response(cache_key)
+    if cached_quiz:
+        logger.debug(f"Using cached quiz")
+        return cached_quiz.get("quiz")
+    
     # Truncate text to avoid token limits
     truncated_text = text[:4000]
-    prompt = f"With the context of this text:{truncated_text}, generate a quiz for the user ranging from 5 to 20 questions to help the user practice and test their understanding of the concepts in the text. Present your response in markdown format "
+    prompt = f"""With the context of this text: {truncated_text}, generate a quiz with 5-10 questions.
+    Format your response as a JSON object with the following structure:
+    {{
+        "title": "Quiz Title",
+        "description": "Brief description of the quiz",
+        "questions": [
+            {{
+                "id": "q1",
+                "question": "Question text",
+                "options": ["Option A", "Option B", "Option C", "Option D"],
+                "correctAnswer": "Correct option text",
+                "explanation": "Explanation of why this is correct"
+            }}
+        ]
+    }}
+    Make sure to include 5-10 questions and format the response as valid JSON."""
     
     try:
-        logger.debug("Sending request to OpenAI")
+        logger.debug("Generating quiz")
+        
+        # Check if we're within rate limits
+        if not groq_limiter.can_call():
+            logger.warning("Rate limit reached, waiting before generating quiz")
+            time.sleep(20)
+        
         response = llm.invoke(prompt)
-        return response.content
+        
+        # Extract the JSON string from the response
+        content = response.content
+        # Find the JSON object in the response
+        json_start = content.find('{')
+        json_end = content.rfind('}') + 1
+        if json_start == -1 or json_end == 0:
+            raise ValueError("No valid JSON found in response")
+            
+        json_str = content[json_start:json_end]
+        
+        # Parse the JSON string into a Python dictionary
+        quiz_data = json.loads(json_str)
+        
+        # Validate the structure
+        required_fields = ['title', 'description', 'questions']
+        for field in required_fields:
+            if field not in quiz_data:
+                raise ValueError(f"Missing required field: {field}")
+                
+        if not isinstance(quiz_data['questions'], list):
+            raise ValueError("Questions must be a list")
+            
+        for question in quiz_data['questions']:
+            required_question_fields = ['id', 'question', 'options', 'correctAnswer', 'explanation']
+            for field in required_question_fields:
+                if field not in question:
+                    raise ValueError(f"Missing required field in question: {field}")
+        
+        # Cache the quiz data
+        cache_response(cache_key, {"quiz": quiz_data})
+        
+        return quiz_data
+        
     except Exception as e:
         logger.error(f"Error generating quiz: {str(e)}")
+        
+        # Check for rate limit errors
+        error_msg = str(e)
+        if "429" in error_msg or "Too Many Requests" in error_msg:
+            logger.warning("Rate limit hit during quiz generation, adding cooldown")
+            groq_limiter.add_cooldown(30)
+            
+            # Try to create a simple fallback quiz to avoid complete failure
+            fallback_quiz = {
+                "title": "Fallback Quiz",
+                "description": "Sorry, we couldn't generate a detailed quiz due to API limits. Here's a simple quiz instead.",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "What's the primary topic of the uploaded document?",
+                        "options": ["Please review the document", "Option B", "Option C", "Option D"],
+                        "correctAnswer": "Please review the document",
+                        "explanation": "This is a fallback quiz due to API limitations."
+                    }
+                ]
+            }
+            return fallback_quiz
+            
         raise HTTPException(status_code=500, detail=f"Error generating quiz: {str(e)}")
 
 
