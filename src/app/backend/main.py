@@ -22,6 +22,7 @@ import time
 import json
 import hashlib
 import threading
+import subprocess
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -65,7 +66,7 @@ def cache_response(cache_key: str, response_data: Dict[str, Any]) -> None:
 ## These are neccesary paths and configurations for the app to run. Tesseract helps with extracting the text from the file, 
 ## Poppler helps with converting the PDF to images, and FFmpeg helps with combining the audio files.
 ## Google Cloud credentials are used to generate the audio.
-## The paths are set up for Windows.
+## The paths are set up for Windows and Docker/Linux environments.
 
 # Set up paths
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
@@ -77,8 +78,11 @@ CREDENTIALS_DIR.mkdir(exist_ok=True)
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("static", exist_ok=True)
 
+# Check if we're running in Docker/Render
+is_docker = os.environ.get('RENDER', 'false').lower() == 'true' or os.path.exists('/.dockerenv')
+
 # Set paths for different operating systems
-if os.name == 'nt':  # Windows
+if os.name == 'nt' and not is_docker:  # Windows (local development)
     # Tesseract configuration
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
     if not os.path.exists(pytesseract.pytesseract.tesseract_cmd):
@@ -100,9 +104,43 @@ if os.name == 'nt':  # Windows
     # Add FFmpeg to system PATH for pydub
     if FFMPEG_PATH not in os.environ['PATH']:
         os.environ['PATH'] += os.pathsep + FFMPEG_PATH
-else:  # Linux/MacOS (deployment environment)
-    # For Linux deployment, these binaries are installed via apt-get in start.sh
-    pass
+else:  # Linux/Docker/Render
+    # In Docker, these should be installed in standard locations
+    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+    POPPLER_PATH = '/usr/bin'
+    FFMPEG_PATH = '/usr/bin'
+    
+    # Set the ffmpeg paths for pydub
+    AudioSegment.converter = '/usr/bin/ffmpeg'
+    AudioSegment.ffmpeg = '/usr/bin/ffmpeg'
+    AudioSegment.ffprobe = '/usr/bin/ffprobe'
+    
+    logger.debug("Running in Docker/Linux environment")
+    logger.debug(f"Tesseract path: {pytesseract.pytesseract.tesseract_cmd}")
+    logger.debug(f"Poppler path: {POPPLER_PATH}")
+    logger.debug(f"FFmpeg path: {FFMPEG_PATH}")
+
+def verify_binaries():
+    """Verify that required binaries are available"""
+    try:
+        logger.debug("Verifying binary installations...")
+        subprocess.run(['tesseract', '--version'], capture_output=True, check=True)
+        logger.debug("Tesseract verified")
+        
+        subprocess.run(['pdftoppm', '-v'], capture_output=True, check=True)
+        logger.debug("Poppler verified")
+        
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        logger.debug("FFmpeg verified")
+        
+        logger.debug("All required binaries verified successfully")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Binary verification failed: {str(e)}")
+        raise RuntimeError(f"Required binary verification failed: {str(e)}")
+    except Exception as e:
+        logger.error(f"Binary verification failed: {str(e)}")
+        raise RuntimeError(f"Required binary verification failed: {str(e)}")
+
 
 # Verify Google Cloud credentials
 google_creds_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
@@ -220,7 +258,14 @@ async def transcribe_document(audio_file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error transcribing audio: {str(e)}")
 
-
+# Call verify_binaries during startup to ensure all required tools are available
+@app.on_event("startup")
+async def startup_event():
+    try:
+        verify_binaries()
+    except Exception as e:
+        logger.error(f"Failed to verify required binaries during startup: {str(e)}")
+        # Log but don't crash, as the binary might be available in a different way
 
 @app.post("/api/summarize", response_model=SummaryResponse)
 async def summarize_document(
@@ -681,43 +726,49 @@ def synthesize_long_audio(text: str, output_path: str) -> str:
     # Initialize temp_files at the start to ensure it's always available
     temp_files = []
     try:
-        # Verify FFmpeg is available
-        try:
-            # First try the standard Program Files location
-            FFMPEG_PATH = r"C:\Program Files\ffmpeg\bin"
-            if not os.path.exists(FFMPEG_PATH):
-                # Fall back to the Downloads location
-                FFMPEG_PATH = r"C:\Users\3d3n2\Downloads\ffmpeg-master-latest-win64-gpl-shared\ffmpeg-master-latest-win64-gpl-shared\bin"
-            
-            if not os.path.exists(FFMPEG_PATH):
-                raise RuntimeError("FFmpeg directory not found")
-            
-            # Check for required files
-            required_files = ['ffmpeg.exe', 'ffprobe.exe']
-            missing_files = [f for f in required_files if not os.path.exists(os.path.join(FFMPEG_PATH, f))]
-            if missing_files:
-                raise RuntimeError(f"Missing FFmpeg files: {', '.join(missing_files)}")
-            
-            # Add to PATH if not already there
-            if FFMPEG_PATH not in os.environ['PATH']:
-                os.environ['PATH'] = FFMPEG_PATH + os.pathsep + os.environ['PATH']
-            
-            # Explicitly set ffmpeg paths for pydub
-            AudioSegment.converter = os.path.join(FFMPEG_PATH, "ffmpeg.exe")
-            AudioSegment.ffmpeg = os.path.join(FFMPEG_PATH, "ffmpeg.exe")
-            AudioSegment.ffprobe = os.path.join(FFMPEG_PATH, "ffprobe.exe")
-            
-            # Test FFmpeg by trying to create a silent audio segment
+        # Verify FFmpeg is available - different approach based on environment
+        if os.name == 'nt' and not is_docker:  # Windows local development
             try:
-                # Create a 1ms silent audio segment to test FFmpeg
-                AudioSegment.silent(duration=1)
-                logger.debug("FFmpeg test successful")
+                # First try the standard Program Files location
+                FFMPEG_PATH = r"C:\Program Files\ffmpeg\bin"
+                if not os.path.exists(FFMPEG_PATH):
+                    # Fall back to the Downloads location
+                    FFMPEG_PATH = r"C:\Users\3d3n2\Downloads\ffmpeg-master-latest-win64-gpl-shared\ffmpeg-master-latest-win64-gpl-shared\bin"
+                
+                if not os.path.exists(FFMPEG_PATH):
+                    raise RuntimeError("FFmpeg directory not found")
+                
+                # Check for required files
+                required_files = ['ffmpeg.exe', 'ffprobe.exe']
+                missing_files = [f for f in required_files if not os.path.exists(os.path.join(FFMPEG_PATH, f))]
+                if missing_files:
+                    raise RuntimeError(f"Missing FFmpeg files: {', '.join(missing_files)}")
+                
+                # Add to PATH if not already there
+                if FFMPEG_PATH not in os.environ['PATH']:
+                    os.environ['PATH'] = FFMPEG_PATH + os.pathsep + os.environ['PATH']
+                
+                # Explicitly set ffmpeg paths for pydub
+                AudioSegment.converter = os.path.join(FFMPEG_PATH, "ffmpeg.exe")
+                AudioSegment.ffmpeg = os.path.join(FFMPEG_PATH, "ffmpeg.exe")
+                AudioSegment.ffprobe = os.path.join(FFMPEG_PATH, "ffprobe.exe")
             except Exception as e:
-                raise RuntimeError(f"FFmpeg test failed: {str(e)}")
+                raise RuntimeError(f"FFmpeg not properly configured on Windows: {str(e)}")
+        else:  # Docker/Render environment
+            # In Docker, ffmpeg should be available in standard locations
+            AudioSegment.converter = '/usr/bin/ffmpeg'
+            AudioSegment.ffmpeg = '/usr/bin/ffmpeg'
+            AudioSegment.ffprobe = '/usr/bin/ffprobe'
             
+            logger.debug("Using Docker/Linux FFmpeg configuration")
+            
+        # Test FFmpeg by trying to create a silent audio segment
+        try:
+            # Create a 1ms silent audio segment to test FFmpeg
+            AudioSegment.silent(duration=1)
+            logger.debug("FFmpeg test successful")
         except Exception as e:
-            logger.error(f"FFmpeg not properly configured: {str(e)}")
-            raise RuntimeError(f"FFmpeg not properly configured. Please ensure FFmpeg is installed and in your system PATH. Error: {str(e)}")
+            raise RuntimeError(f"FFmpeg test failed: {str(e)}")
 
         client = texttospeech.TextToSpeechClient()
         chunks = split_text_into_chunks(text)
