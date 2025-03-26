@@ -1,9 +1,9 @@
 services:
   - type: web
     name: ryzn-notes-api
-    env: python
-    buildCommand: pip install -r src/app/backend/requirements.txt
-    startCommand: ./start.sh
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     envVars:
       - key: PYTHON_VERSION
         value: 3.10.0
