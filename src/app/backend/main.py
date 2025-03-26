@@ -8,12 +8,9 @@ import uuid
 import logging
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
-import pytesseract
-from pdf2image import convert_from_path
 from langchain_groq import ChatGroq
 from gtts import gTTS
 from dotenv import load_dotenv
-import whisper
 from google.cloud import texttospeech
 from pathlib import Path
 import re
@@ -22,7 +19,7 @@ import time
 import json
 import hashlib
 import threading
-import subprocess
+from pdfminer.high_level import extract_text as extract_pdf_text
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -63,11 +60,6 @@ def cache_response(cache_key: str, response_data: Dict[str, Any]) -> None:
     except Exception as e:
         logger.error(f"Error caching response: {str(e)}")
 
-## These are neccesary paths and configurations for the app to run. Tesseract helps with extracting the text from the file, 
-## Poppler helps with converting the PDF to images, and FFmpeg helps with combining the audio files.
-## Google Cloud credentials are used to generate the audio.
-## The paths are set up for Windows and Docker/Linux environments.
-
 # Set up paths
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
 CREDENTIALS_DIR = BASE_DIR / "credentials"
@@ -77,70 +69,6 @@ CREDENTIALS_FILE = CREDENTIALS_DIR / "google-credentials.json"
 CREDENTIALS_DIR.mkdir(exist_ok=True)
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("static", exist_ok=True)
-
-# Check if we're running in Docker/Render
-is_docker = os.environ.get('RENDER', 'false').lower() == 'true' or os.path.exists('/.dockerenv')
-
-# Set paths for different operating systems
-if os.name == 'nt' and not is_docker:  # Windows (local development)
-    # Tesseract configuration
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-    if not os.path.exists(pytesseract.pytesseract.tesseract_cmd):
-        logger.error(f"Tesseract not found at {pytesseract.pytesseract.tesseract_cmd}")
-        raise RuntimeError(f"Tesseract not found at {pytesseract.pytesseract.tesseract_cmd}. Please install Tesseract and ensure it's in the correct location.")
-
-    # Poppler configuration
-    POPPLER_PATH = r"C:\Program Files\poppler-24.08.0\Library\bin"
-    if not os.path.exists(POPPLER_PATH):
-        logger.error(f"Poppler not found at {POPPLER_PATH}")
-        raise RuntimeError(f"Poppler not found at {POPPLER_PATH}. Please install Poppler and ensure it's in the correct location.")
-
-    # FFmpeg configuration
-    FFMPEG_PATH = r"C:\Users\3d3n2\Downloads\ffmpeg-master-latest-win64-gpl-shared\ffmpeg-master-latest-win64-gpl-shared\bin"
-    if not os.path.exists(FFMPEG_PATH):
-        logger.error(f"FFmpeg not found at {FFMPEG_PATH}")
-        raise RuntimeError(f"FFmpeg not found at {FFMPEG_PATH}. Please install FFmpeg and ensure it's in the correct location.")
-    
-    # Add FFmpeg to system PATH for pydub
-    if FFMPEG_PATH not in os.environ['PATH']:
-        os.environ['PATH'] += os.pathsep + FFMPEG_PATH
-else:  # Linux/Docker/Render
-    # In Docker, these should be installed in standard locations
-    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-    POPPLER_PATH = '/usr/bin'
-    FFMPEG_PATH = '/usr/bin'
-    
-    # Set the ffmpeg paths for pydub
-    AudioSegment.converter = '/usr/bin/ffmpeg'
-    AudioSegment.ffmpeg = '/usr/bin/ffmpeg'
-    AudioSegment.ffprobe = '/usr/bin/ffprobe'
-    
-    logger.debug("Running in Docker/Linux environment")
-    logger.debug(f"Tesseract path: {pytesseract.pytesseract.tesseract_cmd}")
-    logger.debug(f"Poppler path: {POPPLER_PATH}")
-    logger.debug(f"FFmpeg path: {FFMPEG_PATH}")
-
-def verify_binaries():
-    """Verify that required binaries are available"""
-    try:
-        logger.debug("Verifying binary installations...")
-        subprocess.run(['tesseract', '--version'], capture_output=True, check=True)
-        logger.debug("Tesseract verified")
-        
-        subprocess.run(['pdftoppm', '-v'], capture_output=True, check=True)
-        logger.debug("Poppler verified")
-        
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-        logger.debug("FFmpeg verified")
-        
-        logger.debug("All required binaries verified successfully")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Binary verification failed: {str(e)}")
-        raise RuntimeError(f"Required binary verification failed: {str(e)}")
-    except Exception as e:
-        logger.error(f"Binary verification failed: {str(e)}")
-        raise RuntimeError(f"Required binary verification failed: {str(e)}")
-
 
 # Verify Google Cloud credentials
 google_creds_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
@@ -240,14 +168,8 @@ class RateLimiter:
 # Create rate limiter for Groq API
 groq_limiter = RateLimiter(max_calls=12, time_period=86400)  # 182 calls per day
 
-## This is the code for the summarize feature. User upload file and it will generate a summary of the file.
-## The user can have a text summary of a file or an audio summary of a file.
-## The user can also have notes generated from the file in markdown format.
-## Finally, the user can have a tts audio version of the file that can be played. 
-
 @app.post("/api/transcribe", response_model=SummaryResponse)
 async def transcribe_document(audio_file: UploadFile = File(...)):
-    pass
     try:
         audio_path = f"uploads/{audio_file.filename}"
         with open(audio_path, "wb") as buffer:
@@ -257,15 +179,6 @@ async def transcribe_document(audio_file: UploadFile = File(...)):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error transcribing audio: {str(e)}")
-
-# Call verify_binaries during startup to ensure all required tools are available
-@app.on_event("startup")
-async def startup_event():
-    try:
-        verify_binaries()
-    except Exception as e:
-        logger.error(f"Failed to verify required binaries during startup: {str(e)}")
-        # Log but don't crash, as the binary might be available in a different way
 
 @app.post("/api/summarize", response_model=SummaryResponse)
 async def summarize_document(
@@ -376,7 +289,6 @@ async def summarize_document(
             except Exception as e:
                 logger.error(f"Error cleaning up file: {str(e)}")
 
-
 @app.post("/api/response", response_model=ChatResponse)
 async def generate_response(request: ChatRequest):
     try:
@@ -404,60 +316,21 @@ async def generate_response(request: ChatRequest):
         logger.error(f"Error generating response: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
 
-
 def extract_text(file_path):
-    # Handle different file formats
-    if file_path.lower().endswith(".pdf"):
-        logger.debug("Processing PDF file")
-        return extract_from_pdf(file_path)
-    elif file_path.lower().endswith(".txt"):
-        logger.debug("Processing TXT file")
-        with open(file_path, "r", encoding="utf-8") as f:
-            return f.read()
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported file format")
-
-def extract_from_pdf(file_path):
-    # Convert PDF to images and extract text using OCR
+    """Extract text from PDF or TXT files using pdfminer.six"""
     try:
-        logger.debug("Converting PDF to images")
-        if os.name == 'nt':  # Windows
-            from pdf2image.exceptions import PDFPageCountError
-            try:
-                logger.debug(f"Using Poppler path: {POPPLER_PATH}")
-                images = convert_from_path(
-                    file_path,
-                    poppler_path=POPPLER_PATH
-                )
-            except PDFPageCountError as e:
-                logger.error(f"Error converting PDF: {str(e)}")
-                raise HTTPException(status_code=500, detail="Invalid or corrupted PDF file")
-            except Exception as e:
-                logger.error(f"Error converting PDF with Poppler: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Error converting PDF: {str(e)}")
+        if file_path.lower().endswith('.pdf'):
+            logger.debug("Processing PDF file")
+            return extract_pdf_text(file_path)
+        elif file_path.lower().endswith('.txt'):
+            logger.debug("Processing TXT file")
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
         else:
-            images = convert_from_path(file_path)
-        
-        logger.debug(f"Converted PDF to {len(images)} images")
-        text = ""
-        for i, image in enumerate(images):
-            logger.debug(f"Processing image {i+1}/{len(images)}")
-            try:
-                page_text = pytesseract.image_to_string(image)
-                text += page_text + "\n\n"
-                logger.debug(f"Successfully extracted text from image {i+1}")
-            except Exception as e:
-                logger.error(f"Error processing image {i+1}: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Error processing PDF page {i+1}: {str(e)}")
-        
-        if not text.strip():
-            raise HTTPException(status_code=400, detail="No text could be extracted from the PDF.")
-        return text
+            raise HTTPException(status_code=400, detail="Unsupported file format")
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        logger.error(f"Error in extract_from_pdf: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error extracting text: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error extracting text: {str(e)}")
 
 def chunk_text(text: str, max_chunk_size: int = 2000) -> List[str]:
     """Split text into smaller chunks while preserving sentence boundaries."""
@@ -670,18 +543,6 @@ def generate_quiz(text):
             
         raise HTTPException(status_code=500, detail=f"Error generating quiz: {str(e)}")
 
-
-def transcribe_audio_file(audio_path):
-    # Use Whisper to transcribe the audio file
-    try:
-        # Load the Whisper model
-        model = whisper.load_model("base")
-        result = model.transcribe(audio_path)
-        return result["text"]
-    except Exception as e:
-        logger.error(f"Error transcribing audio: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error transcribing audio: {str(e)}")
-
 def generate_notes(text):
     # Use LLM to generate notes
     prompt = f"Generate notes from the following text: {text}. Use markdown format. Use the following format: # Title\n\n## Summary\n\n## Key Points\n\n## Additional Information\n\n## References"
@@ -692,12 +553,6 @@ def generate_notes(text):
     except Exception as e:
         logger.error(f"Error generating notes: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating notes: {str(e)}")
-
-
-## This is the code for the audio reading feature. User upload file and it will generate a audio file that can be played.
-## It uses the Google Cloud Text-to-Speech API to generate the audio.
-## It splits the text into chunks and combines them into a single audio file.
-## It also has a timeout of 10 minutes.
 
 def split_text_into_chunks(text: str, max_bytes: int = 4800) -> List[str]:
     """Split text into chunks that are within the byte limit."""
@@ -726,50 +581,6 @@ def synthesize_long_audio(text: str, output_path: str) -> str:
     # Initialize temp_files at the start to ensure it's always available
     temp_files = []
     try:
-        # Verify FFmpeg is available - different approach based on environment
-        if os.name == 'nt' and not is_docker:  # Windows local development
-            try:
-                # First try the standard Program Files location
-                FFMPEG_PATH = r"C:\Program Files\ffmpeg\bin"
-                if not os.path.exists(FFMPEG_PATH):
-                    # Fall back to the Downloads location
-                    FFMPEG_PATH = r"C:\Users\3d3n2\Downloads\ffmpeg-master-latest-win64-gpl-shared\ffmpeg-master-latest-win64-gpl-shared\bin"
-                
-                if not os.path.exists(FFMPEG_PATH):
-                    raise RuntimeError("FFmpeg directory not found")
-                
-                # Check for required files
-                required_files = ['ffmpeg.exe', 'ffprobe.exe']
-                missing_files = [f for f in required_files if not os.path.exists(os.path.join(FFMPEG_PATH, f))]
-                if missing_files:
-                    raise RuntimeError(f"Missing FFmpeg files: {', '.join(missing_files)}")
-                
-                # Add to PATH if not already there
-                if FFMPEG_PATH not in os.environ['PATH']:
-                    os.environ['PATH'] = FFMPEG_PATH + os.pathsep + os.environ['PATH']
-                
-                # Explicitly set ffmpeg paths for pydub
-                AudioSegment.converter = os.path.join(FFMPEG_PATH, "ffmpeg.exe")
-                AudioSegment.ffmpeg = os.path.join(FFMPEG_PATH, "ffmpeg.exe")
-                AudioSegment.ffprobe = os.path.join(FFMPEG_PATH, "ffprobe.exe")
-            except Exception as e:
-                raise RuntimeError(f"FFmpeg not properly configured on Windows: {str(e)}")
-        else:  # Docker/Render environment
-            # In Docker, ffmpeg should be available in standard locations
-            AudioSegment.converter = '/usr/bin/ffmpeg'
-            AudioSegment.ffmpeg = '/usr/bin/ffmpeg'
-            AudioSegment.ffprobe = '/usr/bin/ffprobe'
-            
-            logger.debug("Using Docker/Linux FFmpeg configuration")
-            
-        # Test FFmpeg by trying to create a silent audio segment
-        try:
-            # Create a 1ms silent audio segment to test FFmpeg
-            AudioSegment.silent(duration=1)
-            logger.debug("FFmpeg test successful")
-        except Exception as e:
-            raise RuntimeError(f"FFmpeg test failed: {str(e)}")
-
         client = texttospeech.TextToSpeechClient()
         chunks = split_text_into_chunks(text)
         combined_audio = None
@@ -845,6 +656,17 @@ def synthesize_long_audio(text: str, output_path: str) -> str:
                     logger.debug(f"Cleaned up temporary file: {temp_file}")
             except Exception as e:
                 logger.error(f"Error cleaning up temporary file {temp_file}: {str(e)}")
+
+def transcribe_audio_file(audio_path):
+    # Use Whisper to transcribe the audio file
+    try:
+        # Load the Whisper model
+        model = whisper.load_model("base")
+        result = model.transcribe(audio_path)
+        return result["text"]
+    except Exception as e:
+        logger.error(f"Error transcribing audio: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error transcribing audio: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
