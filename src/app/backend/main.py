@@ -113,7 +113,7 @@ if not groq_api_key:
     raise ValueError("GROQ_API_KEY environment variable is not set")
 
 llm = ChatGroq(
-    model_name="mixtral-8x7b-32768",  # Using Mixtral model from Groq
+    model_name="llama-3.3-70b-versatile",  # Using llama model from Groq; mixtral model deprecated
     temperature=0.7,
     api_key=groq_api_key,
     streaming=False
