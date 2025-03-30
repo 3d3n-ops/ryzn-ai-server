@@ -10,7 +10,7 @@ openai-whisper==20231117
 google-cloud-texttospeech==2.25.1
 pydub==0.25.1
 pillow==11.1.0
-pydantic==2.10.6
+pydantic==2.11.1
 pydantic-settings==2.2.1
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
