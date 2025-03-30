@@ -26,6 +26,9 @@ from fastapi import WebSocketDisconnect
 import base64
 import whisper
 import tempfile
+from .config import Settings, get_settings
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import JSONResponse
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -33,6 +36,9 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables first
 load_dotenv()
+
+# Get settings
+settings = get_settings()
 
 # Set up caching
 CACHE_DIR = Path("cache")
@@ -108,14 +114,15 @@ allowed_origins = [
     "http://127.0.0.1:8000"
 ]
 
-# CORS middleware to allow requests from the frontend
+# Configure request size limit
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"]
+    expose_headers=["*"],
+    max_request_size=settings.MAX_UPLOAD_SIZE  # Apply the upload size limit
 )
 
 # Mount static directory for serving audio files
@@ -566,11 +573,21 @@ class AudioTranscriptionRequest(BaseModel):
     audio_data: str  # Base64 encoded audio data
     language_code: str = "en-US"  # Default to English
 
+# Initialize Whisper model at startup
+logger.debug("Loading Whisper model at startup")
+whisper_model = whisper.load_model("base")
+logger.debug("Whisper model loaded successfully")
+
 @app.post("/api/transcribe-recording")
 async def transcribe_recording(request: AudioTranscriptionRequest):
     try:
-        # Add debug logging
-        logger.debug("Received transcription request")
+        # Add debug logging for request size
+        audio_size = len(request.audio_data.encode('utf-8'))
+        logger.debug(f"Received transcription request with audio data size: {audio_size / (1024 * 1024):.2f}MB")
+        
+        if audio_size > settings.MAX_UPLOAD_SIZE:
+            logger.error(f"Audio data size ({audio_size} bytes) exceeds limit ({settings.MAX_UPLOAD_SIZE} bytes)")
+            raise HTTPException(status_code=413, detail=f"Audio data size exceeds the maximum limit of {settings.MAX_UPLOAD_SIZE / (1024 * 1024):.1f}MB")
         
         # Decode base64 audio data
         try:
@@ -586,20 +603,17 @@ async def transcribe_recording(request: AudioTranscriptionRequest):
                 temp_file.write(audio_bytes)
                 temp_file_path = temp_file.name
                 logger.debug(f"Created temporary file: {temp_file_path}")
+                logger.debug(f"Temporary file size: {os.path.getsize(temp_file_path) / (1024 * 1024):.2f}MB")
         except Exception as e:
             logger.error(f"Error creating temporary file: {str(e)}")
             raise HTTPException(status_code=500, detail="Error processing audio file")
         
         try:
-            # Load the Whisper model (using base model for faster processing)
-            logger.debug("Loading Whisper model")
-            model = whisper.load_model("base")
-            
-            # Transcribe the audio
-            logger.debug("Starting transcription")
-            result = model.transcribe(temp_file_path)
+            # Use the pre-loaded Whisper model
+            logger.debug("Starting transcription with pre-loaded model")
+            result = whisper_model.transcribe(temp_file_path)
             transcript = result["text"]
-            logger.debug(f"Transcription completed, length: {len(transcript)}")
+            logger.debug(f"Transcription completed, length: {len(transcript)} characters")
             
             # Generate notes from the transcript
             notes_prompt = f"""Please generate comprehensive lecture notes from this transcript. 
@@ -697,6 +711,20 @@ async def summarize_file(
             status_code=500,
             detail=f"Error processing file: {str(e)}"
         )
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if exc.status_code == 413:  # Request Entity Too Large
+        return JSONResponse(
+            status_code=413,
+            content={
+                "detail": f"File size exceeds the maximum limit of {settings.MAX_UPLOAD_SIZE / (1024 * 1024):.1f}MB"
+            }
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": str(exc.detail)}
+    )
 
 if __name__ == "__main__":
     import uvicorn
