@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import os
@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from langchain_groq import ChatGroq
 from gtts import gTTS
 from dotenv import load_dotenv
-from google.cloud import texttospeech
+from google.cloud import texttospeech, speech
 from pathlib import Path
 import re
 from pydub import AudioSegment
@@ -20,6 +20,11 @@ import json
 import hashlib
 import threading
 from pdfminer.high_level import extract_text as extract_pdf_text
+from queue import Queue
+from threading import Thread
+import asyncio
+from fastapi import WebSocketDisconnect
+import base64
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -145,9 +150,20 @@ class RateLimiter:
         self.time_period = time_period
         self.calls = []
         self.lock = False
+        self.last_reset = time.time()
+        self.backoff_time = 5  # Initial backoff time in seconds
+        self.max_backoff = 300  # Maximum backoff time (5 minutes)
     
     def can_call(self):
         current_time = time.time()
+        
+        # Reset calls if we're past the time period
+        if current_time - self.last_reset >= self.time_period:
+            self.calls = []
+            self.last_reset = current_time
+            self.backoff_time = 5  # Reset backoff time
+            return True
+        
         # Remove old calls
         self.calls = [call_time for call_time in self.calls if current_time - call_time < self.time_period]
         
@@ -155,211 +171,94 @@ class RateLimiter:
         if len(self.calls) < self.max_calls and not self.lock:
             self.calls.append(current_time)
             return True
+            
+        # If we're rate limited, increase backoff time exponentially
+        if not self.lock:
+            self.backoff_time = min(self.backoff_time * 2, self.max_backoff)
+            logger.warning(f"Rate limit reached. Waiting {self.backoff_time} seconds before retry.")
+            time.sleep(self.backoff_time)
+            return self.can_call()  # Try again after backoff
+            
         return False
     
     def add_cooldown(self, seconds=10):
         """Add a cooldown period where no calls are allowed"""
         self.lock = True
+        self.backoff_time = seconds
         threading.Timer(seconds, self._release_lock).start()
     
     def _release_lock(self):
         self.lock = False
+        logger.debug("Rate limit cooldown period ended")
 
-# Create rate limiter for Groq API
-groq_limiter = RateLimiter(max_calls=12, time_period=86400)  # 182 calls per day
+# Create rate limiter for Groq API with more generous limits
+groq_limiter = RateLimiter(max_calls=30, time_period=60)  # 30 calls per minute
 
-@app.post("/api/transcribe", response_model=SummaryResponse)
-async def transcribe_document(audio_file: UploadFile = File(...)):
-    try:
-        audio_path = f"uploads/{audio_file.filename}"
-        with open(audio_path, "wb") as buffer:
-            shutil.copyfileobj(audio_file.file, buffer)
-        transcript = transcribe_audio_file(audio_path)
-        return SummaryResponse(transcript=transcript)
+# Add a queue for processing chunks
+class ChunkProcessor:
+    def __init__(self, max_workers=3):
+        self.queue = Queue()
+        self.workers = []
+        self.results = {}
+        self.lock = threading.Lock()
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error transcribing audio: {str(e)}")
-
-@app.post("/api/summarize", response_model=SummaryResponse)
-async def summarize_document(
-    file: UploadFile = File(...),
-    output_type: str = Form("text")
-):
-    # Generate a unique file ID
-    file_id = str(uuid.uuid4())
-    file_path = None
+        # Start worker threads
+        for _ in range(max_workers):
+            worker = Thread(target=self._process_chunks, daemon=True)
+            worker.start()
+            self.workers.append(worker)
     
-    try:
-        # Create a path for the uploaded file
-        file_extension = os.path.splitext(file.filename)[1].lower()
-        if file_extension not in ['.pdf', '.txt']:
-            raise HTTPException(status_code=400, detail="Unsupported file format. Only PDF and TXT files are supported.")
-        
-        file_path = f"uploads/{file_id}{file_extension}"
-        
-        # Save the uploaded file
-        logger.debug(f"Saving uploaded file to {file_path}")
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        # Extract text from file
-        logger.debug("Starting text extraction")
-        text = extract_text(file_path)
-        if not text.strip():
-            raise HTTPException(status_code=400, detail="No text could be extracted from the file.")
-        logger.debug(f"Extracted text length: {len(text)}")
-        
-        # Check cache first
-        cache_key = get_cache_key(text, output_type)
-        cached_response = get_cached_response(cache_key)
-        if cached_response:
-            logger.debug("Using cached response")
-            return SummaryResponse(**cached_response)
-        
-        # Generate summary
-        logger.debug("Generating summary")
-        summary = generate_summary(text)
-
-        # Generate notes if requested
-        notes = None
-        if output_type == "notes":
-            logger.debug("Generating notes")
-            notes = generate_notes(text)    
-        
-        # Generate quiz if requested
-        quiz = None
-        if output_type == "quiz":
-            logger.debug("Generating quiz")
-            quiz = generate_quiz(text) 
-
-        # Generate audio if requested
-        audio_url = None
-        if output_type == "audio":
-            logger.debug("Generating audio")
-            audio_filename = f"{file_id}.mp3"
-            audio_path = f"static/{audio_filename}"
-            
-            tts = gTTS(text=summary, lang="en")
-            tts.save(audio_path)
-            
-            audio_url = f"/static/{audio_filename}"
-
-        # Generate audio reading from text if requested
-        tts_audio_url = None
-        if output_type == "tts_audio":
+    def add_chunk(self, chunk_id: str, chunk: str, callback):
+        """Add a chunk to the processing queue"""
+        self.queue.put((chunk_id, chunk, callback))
+    
+    def _process_chunks(self):
+        """Worker thread to process chunks"""
+        while True:
             try:
-                logger.debug("Generating audio with Google Cloud Studio voice")
-                audio_filename = f"{file_id}.mp3"
-                audio_path = f"static/{audio_filename}"
+                chunk_id, chunk, callback = self.queue.get()
                 
-                # Use the long audio synthesis function
-                synthesize_long_audio(text, audio_path)
-                tts_audio_url = f"/static/{audio_filename}"
+                # Process the chunk
+                try:
+                    result = callback(chunk)
+                    with self.lock:
+                        self.results[chunk_id] = result
+                except Exception as e:
+                    logger.error(f"Error processing chunk {chunk_id}: {str(e)}")
+                    with self.lock:
+                        self.results[chunk_id] = None
                 
+                self.queue.task_done()
             except Exception as e:
-                logger.error(f"Error generating audio: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Error generating audio: {str(e)}")
-        
-        # Create response object
-        response_data = {
-            "summary": summary,
-            "audio_url": audio_url,
-            "notes": notes,
-            "tts_audio_url": tts_audio_url,
-            "quiz": quiz
-        }
-        
-        # Cache the response
-        cache_response(cache_key, response_data)
-        
-        return SummaryResponse(**response_data)
+                logger.error(f"Error in chunk processor: {str(e)}")
     
-    except Exception as e:
-        logger.error(f"Error processing file: {str(e)}", exc_info=True)
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail=str(e))
+    def get_result(self, chunk_id: str):
+        """Get the result for a chunk"""
+        with self.lock:
+            return self.results.get(chunk_id)
     
-    finally:
-        # Clean up the uploaded file
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                logger.debug(f"Cleaned up file: {file_path}")
-            except Exception as e:
-                logger.error(f"Error cleaning up file: {str(e)}")
+    def wait_for_all(self):
+        """Wait for all chunks to be processed"""
+        self.queue.join()
 
-@app.post("/api/response", response_model=ChatResponse)
-async def generate_response(request: ChatRequest):
-    try:
-        # Truncate text to avoid token limits
-        truncated_text = request.text[:4000]  # Limit to 4000 characters
-        
-        prompt = f"""You are a helpful assistant for students, helping them answer questions about the files they upload for studying. 
-        With the context of the following text:
+# Create a global chunk processor
+chunk_processor = ChunkProcessor()
 
-        {truncated_text}
+def process_chunk_with_llm(chunk: str) -> str:
+    """Process a single chunk with the LLM"""
+    prompt = f"""Please provide a concise summary of the following text:
 
-        Answer the user's query: {request.user_query}
-        
-        Be concise and direct. Be clear when you don't know the answer based on the provided context."""
-        
-        logger.debug("Sending request to OpenAI")
-        response = llm.invoke(prompt)
-        generated_response = response.content
-        
-        return ChatResponse(
-            response=generated_response,
-            user_query=request.user_query
-        )
-    except Exception as e:
-        logger.error(f"Error generating response: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
+    {chunk}
 
-def extract_text(file_path):
-    """Extract text from PDF or TXT files using pdfminer.six"""
-    try:
-        if file_path.lower().endswith('.pdf'):
-            logger.debug("Processing PDF file")
-            return extract_pdf_text(file_path)
-        elif file_path.lower().endswith('.txt'):
-            logger.debug("Processing TXT file")
-            with open(file_path, 'r', encoding='utf-8') as f:
-                return f.read()
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file format")
-    except Exception as e:
-        logger.error(f"Error extracting text: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error extracting text: {str(e)}")
-
-def chunk_text(text: str, max_chunk_size: int = 2000) -> List[str]:
-    """Split text into smaller chunks while preserving sentence boundaries."""
-    sentences = text.split('.')
-    chunks = []
-    current_chunk = []
-    current_size = 0
+    Focus on the main points and key takeaways. Be direct and concise."""
     
-    for sentence in sentences:
-        sentence = sentence.strip() + '.'
-        sentence_size = len(sentence)
-        
-        if current_size + sentence_size > max_chunk_size and current_chunk:
-            chunks.append(' '.join(current_chunk))
-            current_chunk = []
-            current_size = 0
-        
-        current_chunk.append(sentence)
-        current_size += sentence_size
-    
-    if current_chunk:
-        chunks.append(' '.join(current_chunk))
-    
-    return chunks
+    response = llm.invoke(prompt)
+    return response.content if hasattr(response, 'content') else str(response)
 
 def generate_summary(text):
     try:
         chunks = chunk_text(text)
-        summaries = []
+        chunk_ids = [f"chunk_{i}" for i in range(len(chunks))]
         
         # Check cache for summaries
         cache_key = get_cache_key(text, "summary")
@@ -368,77 +267,43 @@ def generate_summary(text):
             logger.debug("Using cached summary")
             return cached_summary.get("summary", "")
         
-        for chunk in chunks:
+        # Process chunks in parallel
+        for chunk_id, chunk in zip(chunk_ids, chunks):
+            chunk_processor.add_chunk(chunk_id, chunk, process_chunk_with_llm)
+        
+        # Wait for all chunks to be processed
+        chunk_processor.wait_for_all()
+        
+        # Collect results
+        summaries = []
+        for chunk_id in chunk_ids:
+            result = chunk_processor.get_result(chunk_id)
+            if result:
+                summaries.append(result)
+        
+        if not summaries:
+            raise HTTPException(status_code=500, detail="Failed to generate any summaries")
+        
+        # Combine summaries if needed
+        if len(summaries) > 1:
             try:
-                # Check if we're within rate limits
-                if not groq_limiter.can_call():
-                    logger.warning("Rate limit reached, waiting before making API call")
-                    time.sleep(20)  # Wait 20 seconds when rate limited
-                
-                prompt = f"""Please provide a concise summary of the following text:
+                final_prompt = f"""Please provide a concise final summary combining these summaries:
 
-                {chunk}
+                {' '.join(summaries)}
 
                 Focus on the main points and key takeaways. Be direct and concise."""
                 
-                logger.debug(f"Generating summary for chunk of size {len(chunk)}")
-                response = llm.invoke(prompt)
-                
-                # Handle Groq's response format
-                if hasattr(response, 'content'):
-                    summaries.append(response.content)
-                else:
-                    summaries.append(str(response))
-                    
-                # Prevent rate limit issues by adding delay between calls
-                time.sleep(3)
-                
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(f"Error processing chunk: {error_msg}")
-                
-                # Check for rate limit errors
-                if "429" in error_msg or "Too Many Requests" in error_msg:
-                    logger.warning("Rate limit hit, adding cooldown")
-                    groq_limiter.add_cooldown(30)  # 30 second cooldown
-                    time.sleep(30)
-                
-                raise HTTPException(status_code=500, detail=f"Error generating summary: {error_msg}")
-        
-        # Combine summaries
-        if len(summaries) > 1:
-            try:
-                # Check if we're within rate limits
-                if not groq_limiter.can_call():
-                    logger.warning("Rate limit reached for final summary, using first chunk summary")
-                    final_summary = summaries[0]
-                else:
-                    final_prompt = f"""Please provide a concise final summary combining these summaries:
-
-                    {' '.join(summaries)}
-
-                    Focus on the main points and key takeaways. Be direct and concise."""
-                    
-                    final_response = llm.invoke(final_prompt)
-                    
-                    # Handle Groq's response format
-                    if hasattr(final_response, 'content'):
-                        final_summary = final_response.content
-                    else:
-                        final_summary = str(final_response)
-                
-                # Cache the result
-                cache_response(cache_key, {"summary": final_summary})
-                return final_summary
-                    
+                final_response = llm.invoke(final_prompt)
+                final_summary = final_response.content if hasattr(final_response, 'content') else str(final_response)
             except Exception as e:
                 logger.error(f"Error combining summaries: {str(e)}")
-                # If combining fails, return the first summary
-                return summaries[0]
+                final_summary = summaries[0]
         else:
-            # Cache the result
-            cache_response(cache_key, {"summary": summaries[0]})
-            return summaries[0]
+            final_summary = summaries[0]
+        
+        # Cache the result
+        cache_response(cache_key, {"summary": final_summary})
+        return final_summary
             
     except Exception as e:
         logger.error(f"Error generating summary: {str(e)}")
@@ -667,6 +532,121 @@ def transcribe_audio_file(audio_path):
     except Exception as e:
         logger.error(f"Error transcribing audio: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error transcribing audio: {str(e)}")
+
+@app.get("/api/status/{file_id}")
+async def get_status(file_id: str):
+    return {
+        "status": chunk_processor.get_status(file_id),
+        "progress": chunk_processor.get_progress(file_id),
+        "estimated_time_remaining": chunk_processor.get_estimated_time(file_id)
+    }
+
+@app.websocket("/ws/progress/{file_id}")
+async def websocket_endpoint(websocket: WebSocket, file_id: str):
+    await websocket.accept()
+    try:
+        while True:
+            # Send progress updates
+            progress = chunk_processor.get_progress(file_id)
+            await websocket.send_json({"progress": progress})
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        pass
+
+class AudioTranscriptionRequest(BaseModel):
+    audio_data: str  # Base64 encoded audio data
+    language_code: str = "en-US"  # Default to English
+
+@app.post("/api/transcribe-recording")
+async def transcribe_recording(request: AudioTranscriptionRequest):
+    try:
+        # Decode base64 audio data
+        audio_bytes = base64.b64decode(request.audio_data)
+        
+        # Create a temporary file for the audio
+        temp_file = f"uploads/temp_{uuid.uuid4()}.webm"
+        with open(temp_file, "wb") as f:
+            f.write(audio_bytes)
+        
+        # Initialize the Speech-to-Text client
+        client = speech.SpeechClient()
+        
+        # Read the audio file
+        with open(temp_file, "rb") as audio_file:
+            content = audio_file.read()
+        
+        # Configure the audio and recognition settings
+        audio = speech.RecognitionAudio(content=content)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,  # Updated for WebM format
+            sample_rate_hertz=48000,  # Standard WebM sample rate
+            language_code=request.language_code,
+            enable_automatic_punctuation=True,
+            model="default",
+            use_enhanced=True,  # Use enhanced model for better accuracy
+            enable_word_time_offsets=True  # Get word-level timestamps
+        )
+        
+        # Perform the transcription
+        response = client.recognize(config=config, audio=audio)
+        
+        # Process the transcription results
+        transcript_parts = []
+        for result in response.results:
+            transcript_parts.append(result.alternatives[0].transcript)
+        
+        # Combine all transcriptions with proper spacing
+        transcript = " ".join(transcript_parts)
+        
+        # Generate notes from the transcript
+        notes_prompt = f"""Please generate comprehensive lecture notes from this transcript. 
+        Format the notes in markdown with the following structure:
+        
+        # Lecture Notes
+        
+        ## Key Points
+        - Main concepts and ideas
+        
+        ## Detailed Notes
+        - Important details and explanations
+        
+        ## Summary
+        - Brief overview of the main topics
+        
+        Transcript:
+        {transcript}
+        """
+        
+        try:
+            notes_response = llm.invoke(notes_prompt)
+            notes = notes_response.content if hasattr(notes_response, 'content') else str(notes_response)
+        except Exception as e:
+            logger.error(f"Error generating notes: {str(e)}")
+            notes = "Error generating notes. Please try again."
+        
+        # Clean up the temporary file
+        try:
+            os.remove(temp_file)
+        except Exception as e:
+            logger.warning(f"Error removing temporary file: {str(e)}")
+        
+        return {
+            "transcript": transcript,
+            "notes": notes
+        }
+        
+    except Exception as e:
+        logger.error(f"Error transcribing recording: {str(e)}")
+        # Clean up temporary file if it exists
+        try:
+            if 'temp_file' in locals() and os.path.exists(temp_file):
+                os.remove(temp_file)
+        except:
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error transcribing recording: {str(e)}"
+        )
 
 if __name__ == "__main__":
     import uvicorn
