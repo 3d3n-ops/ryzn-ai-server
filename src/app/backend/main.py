@@ -11,7 +11,6 @@ from pydantic import BaseModel
 from langchain_groq import ChatGroq
 from gtts import gTTS
 from dotenv import load_dotenv
-from google.cloud import texttospeech, speech
 from pathlib import Path
 import re
 from pydub import AudioSegment
@@ -25,6 +24,8 @@ from threading import Thread
 import asyncio
 from fastapi import WebSocketDisconnect
 import base64
+import whisper
+import tempfile
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -75,7 +76,7 @@ CREDENTIALS_DIR.mkdir(exist_ok=True)
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("static", exist_ok=True)
 
-# Verify Google Cloud credentials
+# Verify Google Cloud credentials (only for text-to-speech)
 google_creds_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
 if not google_creds_path:
     logger.error("GOOGLE_APPLICATION_CREDENTIALS not set in .env file")
@@ -564,85 +565,58 @@ async def transcribe_recording(request: AudioTranscriptionRequest):
         audio_bytes = base64.b64decode(request.audio_data)
         
         # Create a temporary file for the audio
-        temp_file = f"uploads/temp_{uuid.uuid4()}.webm"
-        with open(temp_file, "wb") as f:
-            f.write(audio_bytes)
-        
-        # Initialize the Speech-to-Text client
-        client = speech.SpeechClient()
-        
-        # Read the audio file
-        with open(temp_file, "rb") as audio_file:
-            content = audio_file.read()
-        
-        # Configure the audio and recognition settings
-        audio = speech.RecognitionAudio(content=content)
-        config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,  # Updated for WebM format
-            sample_rate_hertz=48000,  # Standard WebM sample rate
-            language_code=request.language_code,
-            enable_automatic_punctuation=True,
-            model="default",
-            use_enhanced=True,  # Use enhanced model for better accuracy
-            enable_word_time_offsets=True  # Get word-level timestamps
-        )
-        
-        # Perform the transcription
-        response = client.recognize(config=config, audio=audio)
-        
-        # Process the transcription results
-        transcript_parts = []
-        for result in response.results:
-            transcript_parts.append(result.alternatives[0].transcript)
-        
-        # Combine all transcriptions with proper spacing
-        transcript = " ".join(transcript_parts)
-        
-        # Generate notes from the transcript
-        notes_prompt = f"""Please generate comprehensive lecture notes from this transcript. 
-        Format the notes in markdown with the following structure:
-        
-        # Lecture Notes
-        
-        ## Key Points
-        - Main concepts and ideas
-        
-        ## Detailed Notes
-        - Important details and explanations
-        
-        ## Summary
-        - Brief overview of the main topics
-        
-        Transcript:
-        {transcript}
-        """
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_file:
+            temp_file.write(audio_bytes)
+            temp_file_path = temp_file.name
         
         try:
-            notes_response = llm.invoke(notes_prompt)
-            notes = notes_response.content if hasattr(notes_response, 'content') else str(notes_response)
-        except Exception as e:
-            logger.error(f"Error generating notes: {str(e)}")
-            notes = "Error generating notes. Please try again."
-        
-        # Clean up the temporary file
-        try:
-            os.remove(temp_file)
-        except Exception as e:
-            logger.warning(f"Error removing temporary file: {str(e)}")
-        
-        return {
-            "transcript": transcript,
-            "notes": notes
-        }
-        
+            # Load the Whisper model (using base model for faster processing)
+            model = whisper.load_model("base")
+            
+            # Transcribe the audio
+            result = model.transcribe(temp_file_path)
+            transcript = result["text"]
+            
+            # Generate notes from the transcript
+            notes_prompt = f"""Please generate comprehensive lecture notes from this transcript. 
+            Format the notes in markdown with the following structure:
+            
+            # Lecture Notes
+            
+            ## Key Points
+            - Main concepts and ideas
+            
+            ## Detailed Notes
+            - Important details and explanations
+            
+            ## Summary
+            - Brief overview of the main topics
+            
+            Transcript:
+            {transcript}
+            """
+            
+            try:
+                notes_response = llm.invoke(notes_prompt)
+                notes = notes_response.content if hasattr(notes_response, 'content') else str(notes_response)
+            except Exception as e:
+                logger.error(f"Error generating notes: {str(e)}")
+                notes = "Error generating notes. Please try again."
+            
+            return {
+                "transcript": transcript,
+                "notes": notes
+            }
+            
+        finally:
+            # Clean up the temporary file
+            try:
+                os.unlink(temp_file_path)
+            except Exception as e:
+                logger.warning(f"Error removing temporary file: {str(e)}")
+                
     except Exception as e:
         logger.error(f"Error transcribing recording: {str(e)}")
-        # Clean up temporary file if it exists
-        try:
-            if 'temp_file' in locals() and os.path.exists(temp_file):
-                os.remove(temp_file)
-        except:
-            pass
         raise HTTPException(
             status_code=500,
             detail=f"Error transcribing recording: {str(e)}"
