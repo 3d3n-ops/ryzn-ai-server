@@ -99,7 +99,14 @@ logger.debug(f"Using Google Cloud credentials from: {google_creds_path}")
 app = FastAPI()
 
 # Get the list of allowed origins from environment or use default
-allowed_origins = ["http://localhost:3000", "https://rzn-ai.vercel.app", "https://ryzn-ai-server.onrender.com"]
+ allowed_origins = [
+    "http://localhost:3000",
+    "https://rzn-ai.vercel.app",
+    "https://ryzn-ai-server.onrender.com",
+    "http://localhost:8000",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8000"
+]
 
 # CORS middleware to allow requests from the frontend
 app.add_middleware(
@@ -108,6 +115,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 # Mount static directory for serving audio files
@@ -561,21 +569,37 @@ class AudioTranscriptionRequest(BaseModel):
 @app.post("/api/transcribe-recording")
 async def transcribe_recording(request: AudioTranscriptionRequest):
     try:
+        # Add debug logging
+        logger.debug("Received transcription request")
+        
         # Decode base64 audio data
-        audio_bytes = base64.b64decode(request.audio_data)
+        try:
+            audio_bytes = base64.b64decode(request.audio_data)
+            logger.debug(f"Successfully decoded audio data, size: {len(audio_bytes)} bytes")
+        except Exception as e:
+            logger.error(f"Error decoding base64 audio data: {str(e)}")
+            raise HTTPException(status_code=400, detail="Invalid audio data format")
         
         # Create a temporary file for the audio
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_file:
-            temp_file.write(audio_bytes)
-            temp_file_path = temp_file.name
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_file:
+                temp_file.write(audio_bytes)
+                temp_file_path = temp_file.name
+                logger.debug(f"Created temporary file: {temp_file_path}")
+        except Exception as e:
+            logger.error(f"Error creating temporary file: {str(e)}")
+            raise HTTPException(status_code=500, detail="Error processing audio file")
         
         try:
             # Load the Whisper model (using base model for faster processing)
+            logger.debug("Loading Whisper model")
             model = whisper.load_model("base")
             
             # Transcribe the audio
+            logger.debug("Starting transcription")
             result = model.transcribe(temp_file_path)
             transcript = result["text"]
+            logger.debug(f"Transcription completed, length: {len(transcript)}")
             
             # Generate notes from the transcript
             notes_prompt = f"""Please generate comprehensive lecture notes from this transcript. 
@@ -597,8 +621,10 @@ async def transcribe_recording(request: AudioTranscriptionRequest):
             """
             
             try:
+                logger.debug("Generating notes")
                 notes_response = llm.invoke(notes_prompt)
                 notes = notes_response.content if hasattr(notes_response, 'content') else str(notes_response)
+                logger.debug("Notes generation completed")
             except Exception as e:
                 logger.error(f"Error generating notes: {str(e)}")
                 notes = "Error generating notes. Please try again."
@@ -612,11 +638,14 @@ async def transcribe_recording(request: AudioTranscriptionRequest):
             # Clean up the temporary file
             try:
                 os.unlink(temp_file_path)
+                logger.debug("Cleaned up temporary file")
             except Exception as e:
                 logger.warning(f"Error removing temporary file: {str(e)}")
                 
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        logger.error(f"Error transcribing recording: {str(e)}")
+        logger.error(f"Error transcribing recording: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Error transcribing recording: {str(e)}"
