@@ -651,6 +651,53 @@ async def transcribe_recording(request: AudioTranscriptionRequest):
             detail=f"Error transcribing recording: {str(e)}"
         )
 
+@app.post("/api/summarize")
+async def summarize_file(
+    file: UploadFile = File(...),
+    output_type: str = Form("summary")
+):
+    try:
+        # Create a temporary file to store the uploaded content
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+
+        try:
+            # Extract text based on file type
+            if file.filename.endswith('.pdf'):
+                text = extract_pdf_text(temp_file_path)
+            else:
+                # For text files, read directly
+                with open(temp_file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+
+            # Generate summary or quiz based on output type
+            if output_type == "quiz":
+                result = generate_quiz(text)
+            else:
+                result = generate_summary(text)
+
+            # Generate notes
+            notes = generate_notes(text)
+
+            return {
+                "summary": result if output_type == "summary" else None,
+                "quiz": result if output_type == "quiz" else None,
+                "notes": notes
+            }
+
+        finally:
+            # Clean up the temporary file
+            os.unlink(temp_file_path)
+
+    except Exception as e:
+        logger.error(f"Error processing file: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing file: {str(e)}"
+        )
+
 if __name__ == "__main__":
     import uvicorn
     import os
