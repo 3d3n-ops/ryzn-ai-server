@@ -99,7 +99,7 @@ logger.debug(f"Using Google Cloud credentials from: {google_creds_path}")
 app = FastAPI()
 
 # Get the list of allowed origins from environment or use default
- allowed_origins = [
+allowed_origins = [
     "http://localhost:3000",
     "https://rzn-ai.vercel.app",
     "https://ryzn-ai-server.onrender.com",
