@@ -1,5 +1,7 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from typing import List
+import json
 
 class Settings(BaseSettings):
     # API Security
@@ -8,11 +10,11 @@ class Settings(BaseSettings):
     
     # CORS Settings
     FRONTEND_URL: str = "http://localhost:3000"
-    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
+    ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
     
     # File Upload Settings
     MAX_UPLOAD_SIZE: int = 10 * 1024 * 1024  # 10MB
-    ALLOWED_FILE_TYPES: list[str] = [".pdf", ".txt"]
+    ALLOWED_FILE_TYPES: List[str] = [".pdf", ".txt"]
     
     # Google Cloud Settings
     GOOGLE_APPLICATION_CREDENTIALS: str = "./credentials/google-credentials.json"
@@ -27,6 +29,17 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        
+        @classmethod
+        def parse_env_var(cls, field_name: str, raw_val: str):
+            if field_name == "ALLOWED_ORIGINS":
+                try:
+                    # Try to parse as JSON first
+                    return json.loads(raw_val)
+                except json.JSONDecodeError:
+                    # If not JSON, split by comma
+                    return [origin.strip() for origin in raw_val.split(",")]
+            return raw_val
 
 @lru_cache()
 def get_settings():
