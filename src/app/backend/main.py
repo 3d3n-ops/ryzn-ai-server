@@ -143,7 +143,7 @@ class ChatResponse(BaseModel):
     user_query: str
 
 class ChatRequest(BaseModel):
-    text: str
+    content: dict
     user_query: str
 
 class SummaryResponse(BaseModel):
@@ -300,7 +300,7 @@ def generate_summary(text):
     try:
         # Add timeout for the entire operation
         start_time = time.time()
-        timeout = 300  # 5 minutes timeout
+        timeout = 600  # 10 minutes timeout
         
         chunks = chunk_text(text)
         chunk_ids = [f"chunk_{i}" for i in range(len(chunks))]
@@ -315,13 +315,16 @@ def generate_summary(text):
         # Process chunks in parallel with timeout
         for chunk_id, chunk in zip(chunk_ids, chunks):
             if time.time() - start_time > timeout:
+                logger.error("Summary generation timed out")
                 raise TimeoutError("Summary generation timed out")
                 
             chunk_processor.add_chunk(chunk_id, chunk, process_chunk_with_llm)
         
         # Wait for all chunks to be processed with timeout
-        while not chunk_processor.wait_for_all(timeout=30):  # 30 second timeout per chunk
+        chunk_timeout = 60  # 1 minute timeout per chunk
+        while not chunk_processor.wait_for_all(timeout=chunk_timeout):
             if time.time() - start_time > timeout:
+                logger.error("Summary generation timed out while waiting for chunks")
                 raise TimeoutError("Summary generation timed out")
         
         # Collect results
@@ -330,9 +333,12 @@ def generate_summary(text):
             result = chunk_processor.get_result(chunk_id)
             if result:
                 summaries.append(result)
+            else:
+                logger.error(f"No result for chunk {chunk_id}")
         
         if not summaries:
-            raise HTTPException(status_code=500, detail="Failed to generate any summaries")
+            logger.error("No summaries were generated")
+            raise HTTPException(status_code=500, detail="Failed to generate any summaries. Please try again.")
         
         # Combine summaries if needed
         if len(summaries) > 1:
@@ -357,7 +363,7 @@ def generate_summary(text):
             
     except TimeoutError as e:
         logger.error(f"Timeout generating summary: {str(e)}")
-        raise HTTPException(status_code=504, detail="Summary generation timed out. Please try again.")
+        raise HTTPException(status_code=504, detail="Summary generation timed out. Please try again with a smaller file or split it into parts.")
     except Exception as e:
         logger.error(f"Error generating summary: {str(e)}")
         if isinstance(e, HTTPException):
@@ -1018,6 +1024,46 @@ async def transcribe_audio_file(
             status_code=500,
             detail="An unexpected error occurred. Please try again."
         )
+
+@app.post("/api/response")
+async def get_chat_response(request: ChatRequest) -> ChatResponse:
+    try:
+        # Extract content from request
+        content = request.content
+        user_query = request.user_query
+
+        # Prepare the context for the LLM
+        context = ""
+        if content.get("transcript"):
+            context += f"Transcript:\n{content['transcript']}\n\n"
+        if content.get("notes"):
+            context += f"Notes:\n{content['notes']}\n\n"
+        if content.get("summary"):
+            context += f"Summary:\n{content['summary']}\n\n"
+
+        # Prepare the prompt for the LLM
+        prompt = f"""You are a helpful AI assistant. You have access to the following content:
+
+{context}
+
+Please answer the following question based on the content above:
+{user_query}
+
+Remember to:
+1. Only use information from the provided content
+2. If the answer cannot be found in the content, say so
+3. Be concise but thorough
+4. Use markdown formatting for better readability
+
+Answer:"""
+
+        # Get response from LLM
+        response = llm.invoke(prompt).content
+
+        return ChatResponse(response=response)
+    except Exception as e:
+        logger.error(f"Error in get_chat_response: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
