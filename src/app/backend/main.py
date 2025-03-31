@@ -104,20 +104,9 @@ logger.debug(f"Using Google Cloud credentials from: {google_creds_path}")
 
 app = FastAPI()
 
-# Get the list of allowed origins from environment or use default
-allowed_origins = [
-    "http://localhost:3000",
-    "https://rzn-ai.vercel.app",
-    "https://ryzn-ai-server.onrender.com",
-    "http://localhost:8000",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:8000"
-]
-
-# Configure request size limit
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=settings.ALLOWED_ORIGINS, #use settings.ALLOWED_ORIGINS.
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -648,11 +637,19 @@ async def transcribe_recording(request: AudioTranscriptionRequest):
                 "notes": notes
             }
             
+        except Exception as e:
+            logger.error(f"Error during transcription: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail="Error processing audio transcription. Please try again."
+            )
+            
         finally:
             # Clean up the temporary file
             try:
-                os.unlink(temp_file_path)
-                logger.debug("Cleaned up temporary file")
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+                    logger.debug("Cleaned up temporary file")
             except Exception as e:
                 logger.warning(f"Error removing temporary file: {str(e)}")
                 
@@ -662,7 +659,7 @@ async def transcribe_recording(request: AudioTranscriptionRequest):
         logger.error(f"Error transcribing recording: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Error transcribing recording: {str(e)}"
+            detail="An unexpected error occurred. Please try again."
         )
 
 @app.post("/api/summarize")
