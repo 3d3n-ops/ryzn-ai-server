@@ -732,6 +732,143 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
         content={"detail": str(exc.detail)}
     )
 
+class AudioChunk(BaseModel):
+    chunk_data: str  # Base64 encoded audio chunk
+    chunk_index: int
+    total_chunks: int
+
+class TranscriptionProgress(BaseModel):
+    chunk_index: int
+    total_chunks: int
+    transcript: str
+    is_complete: bool
+
+# Add a queue for processing audio chunks
+class AudioChunkProcessor:
+    def __init__(self, max_workers=2):
+        self.queue = Queue()
+        self.workers = []
+        self.results = {}
+        self.lock = threading.Lock()
+        self.progress = {}
+        
+        # Start worker threads
+        for _ in range(max_workers):
+            worker = Thread(target=self._process_chunks, daemon=True)
+            worker.start()
+            self.workers.append(worker)
+    
+    def add_chunk(self, chunk_id: str, chunk: AudioChunk, callback):
+        """Add a chunk to the processing queue"""
+        self.queue.put((chunk_id, chunk, callback))
+        with self.lock:
+            self.progress[chunk_id] = {
+                'processed_chunks': 0,
+                'total_chunks': chunk.total_chunks,
+                'transcript': '',
+                'is_complete': False
+            }
+    
+    def _process_chunks(self):
+        """Worker thread to process chunks"""
+        while True:
+            try:
+                chunk_id, chunk, callback = self.queue.get()
+                
+                # Process the chunk
+                try:
+                    result = callback(chunk)
+                    with self.lock:
+                        self.results[chunk_id] = self.results.get(chunk_id, [])
+                        self.results[chunk_id].append((chunk.chunk_index, result))
+                        self.progress[chunk_id]['processed_chunks'] += 1
+                        
+                        # Check if all chunks are processed
+                        if self.progress[chunk_id]['processed_chunks'] == chunk.total_chunks:
+                            # Combine transcripts in order
+                            sorted_results = sorted(self.results[chunk_id], key=lambda x: x[0])
+                            combined_transcript = ' '.join([r[1] for r in sorted_results])
+                            self.progress[chunk_id]['transcript'] = combined_transcript
+                            self.progress[chunk_id]['is_complete'] = True
+                except Exception as e:
+                    logger.error(f"Error processing chunk {chunk_id}: {str(e)}")
+                    with self.lock:
+                        self.progress[chunk_id]['error'] = str(e)
+                
+                self.queue.task_done()
+            except Exception as e:
+                logger.error(f"Error in chunk processor: {str(e)}")
+    
+    def get_progress(self, chunk_id: str) -> TranscriptionProgress:
+        """Get the progress for a chunk"""
+        with self.lock:
+            progress = self.progress.get(chunk_id, {})
+            return TranscriptionProgress(
+                chunk_index=progress.get('processed_chunks', 0),
+                total_chunks=progress.get('total_chunks', 0),
+                transcript=progress.get('transcript', ''),
+                is_complete=progress.get('is_complete', False)
+            )
+    
+    def get_error(self, chunk_id: str) -> str:
+        """Get any error that occurred during processing"""
+        with self.lock:
+            return self.progress.get(chunk_id, {}).get('error')
+
+# Create a global chunk processor
+audio_chunk_processor = AudioChunkProcessor()
+
+def process_audio_chunk(chunk: AudioChunk) -> str:
+    """Process a single audio chunk with Whisper"""
+    try:
+        # Decode base64 audio data
+        audio_bytes = base64.b64decode(chunk.chunk_data)
+        
+        # Create a temporary file for the chunk
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_file:
+            temp_file.write(audio_bytes)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Use Whisper to transcribe the chunk
+            result = whisper_model.transcribe(temp_file_path)
+            return result["text"]
+        finally:
+            # Clean up the temporary file
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+    except Exception as e:
+        logger.error(f"Error processing audio chunk: {str(e)}")
+        raise
+
+@app.post("/api/transcribe-chunk")
+async def transcribe_chunk(chunk: AudioChunk):
+    """Handle a single chunk of audio data"""
+    try:
+        chunk_id = f"chunk_{uuid.uuid4()}"
+        audio_chunk_processor.add_chunk(chunk_id, chunk, process_audio_chunk)
+        return {"chunk_id": chunk_id}
+    except Exception as e:
+        logger.error(f"Error processing chunk: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/transcription-progress/{chunk_id}")
+async def get_transcription_progress(chunk_id: str):
+    """Get the progress of a transcription job"""
+    try:
+        progress = audio_chunk_processor.get_progress(chunk_id)
+        error = audio_chunk_processor.get_error(chunk_id)
+        
+        if error:
+            raise HTTPException(status_code=500, detail=error)
+            
+        return progress
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error getting progress: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     import os
