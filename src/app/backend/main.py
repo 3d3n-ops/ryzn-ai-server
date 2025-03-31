@@ -29,9 +29,13 @@ import tempfile
 from .config import Settings, get_settings
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Load environment variables first
@@ -104,14 +108,16 @@ logger.debug(f"Using Google Cloud credentials from: {google_creds_path}")
 
 app = FastAPI()
 
+# Add GZip middleware for compression
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS, #use settings.ALLOWED_ORIGINS.
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
-    max_request_size=settings.MAX_UPLOAD_SIZE  # Apply the upload size limit
 )
 
 # Mount static directory for serving audio files
@@ -569,6 +575,9 @@ logger.debug("Whisper model loaded successfully")
 
 @app.post("/api/transcribe-recording")
 async def transcribe_recording(request: AudioTranscriptionRequest):
+    if not whisper_model:
+        raise HTTPException(status_code=503, detail="Transcription service is not available")
+        
     try:
         # Add debug logging for request size
         audio_size = len(request.audio_data.encode('utf-8'))
