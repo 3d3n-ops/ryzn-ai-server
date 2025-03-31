@@ -869,6 +869,114 @@ async def get_transcription_progress(chunk_id: str):
         logger.error(f"Error getting progress: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+class AudioFileUpload(BaseModel):
+    file: UploadFile
+    output_type: str = "transcript"  # Can be "transcript" or "notes"
+
+@app.post("/api/transcribe-audio")
+async def transcribe_audio_file(
+    file: UploadFile = File(...),
+    output_type: str = Form("transcript")
+):
+    if not whisper_model:
+        raise HTTPException(status_code=503, detail="Transcription service is not available")
+        
+    try:
+        # Validate file type
+        if not file.content_type.startswith('audio/'):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file type. Please upload an audio file (MP3, WAV, M4A, etc.)"
+            )
+        
+        # Validate file size
+        file_size = 0
+        content = await file.read()
+        file_size = len(content)
+        
+        if file_size > settings.MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File size exceeds the maximum limit of {settings.MAX_UPLOAD_SIZE / (1024 * 1024):.1f}MB"
+            )
+        
+        # Create a temporary file for the audio
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file.filename.split(".")[-1]}') as temp_file:
+                temp_file.write(content)
+                temp_file_path = temp_file.name
+                logger.debug(f"Created temporary file: {temp_file_path}")
+                logger.debug(f"Temporary file size: {os.path.getsize(temp_file_path) / (1024 * 1024):.2f}MB")
+        except Exception as e:
+            logger.error(f"Error creating temporary file: {str(e)}")
+            raise HTTPException(status_code=500, detail="Error processing audio file")
+        
+        try:
+            # Use the pre-loaded Whisper model
+            logger.debug("Starting transcription with pre-loaded model")
+            result = whisper_model.transcribe(temp_file_path)
+            transcript = result["text"]
+            logger.debug(f"Transcription completed, length: {len(transcript)} characters")
+            
+            response = {"transcript": transcript}
+            
+            # Generate notes if requested
+            if output_type == "notes":
+                notes_prompt = f"""Please generate comprehensive lecture notes from this transcript. 
+                Format the notes in markdown with the following structure:
+                
+                # Lecture Notes
+                
+                ## Key Points
+                - Main concepts and ideas
+                
+                ## Detailed Notes
+                - Important details and explanations
+                
+                ## Summary
+                - Brief overview of the main topics
+                
+                Transcript:
+                {transcript}
+                """
+                
+                try:
+                    logger.debug("Generating notes")
+                    notes_response = llm.invoke(notes_prompt)
+                    notes = notes_response.content if hasattr(notes_response, 'content') else str(notes_response)
+                    logger.debug("Notes generation completed")
+                    response["notes"] = notes
+                except Exception as e:
+                    logger.error(f"Error generating notes: {str(e)}")
+                    response["notes"] = "Error generating notes. Please try again."
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error during transcription: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail="Error processing audio transcription. Please try again."
+            )
+            
+        finally:
+            # Clean up the temporary file
+            try:
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+                    logger.debug("Cleaned up temporary file")
+            except Exception as e:
+                logger.warning(f"Error removing temporary file: {str(e)}")
+                
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error transcribing audio file: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred. Please try again."
+        )
+
 if __name__ == "__main__":
     import uvicorn
     import os
