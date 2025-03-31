@@ -248,9 +248,14 @@ class ChunkProcessor:
         with self.lock:
             return self.results.get(chunk_id)
     
-    def wait_for_all(self):
-        """Wait for all chunks to be processed"""
-        self.queue.join()
+    def wait_for_all(self, timeout=30):
+        """Wait for all chunks to be processed with timeout"""
+        start_time = time.time()
+        while not self.queue.empty():
+            if time.time() - start_time > timeout:
+                raise TimeoutError("Summary generation timed out")
+            time.sleep(0.1)
+        return True
 
 # Create a global chunk processor
 chunk_processor = ChunkProcessor()
@@ -266,8 +271,37 @@ def process_chunk_with_llm(chunk: str) -> str:
     response = llm.invoke(prompt)
     return response.content if hasattr(response, 'content') else str(response)
 
+def chunk_text(text: str, max_chunk_size: int = 4000) -> List[str]:
+    """Split text into chunks of approximately equal size."""
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    
+    # Split text into sentences
+    sentences = re.split('(?<=[.!?])\s+', text)
+    
+    for sentence in sentences:
+        sentence_size = len(sentence)
+        
+        if current_size + sentence_size > max_chunk_size and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = [sentence]
+            current_size = sentence_size
+        else:
+            current_chunk.append(sentence)
+            current_size += sentence_size
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    return chunks
+
 def generate_summary(text):
     try:
+        # Add timeout for the entire operation
+        start_time = time.time()
+        timeout = 300  # 5 minutes timeout
+        
         chunks = chunk_text(text)
         chunk_ids = [f"chunk_{i}" for i in range(len(chunks))]
         
@@ -278,12 +312,17 @@ def generate_summary(text):
             logger.debug("Using cached summary")
             return cached_summary.get("summary", "")
         
-        # Process chunks in parallel
+        # Process chunks in parallel with timeout
         for chunk_id, chunk in zip(chunk_ids, chunks):
+            if time.time() - start_time > timeout:
+                raise TimeoutError("Summary generation timed out")
+                
             chunk_processor.add_chunk(chunk_id, chunk, process_chunk_with_llm)
         
-        # Wait for all chunks to be processed
-        chunk_processor.wait_for_all()
+        # Wait for all chunks to be processed with timeout
+        while not chunk_processor.wait_for_all(timeout=30):  # 30 second timeout per chunk
+            if time.time() - start_time > timeout:
+                raise TimeoutError("Summary generation timed out")
         
         # Collect results
         summaries = []
@@ -316,6 +355,9 @@ def generate_summary(text):
         cache_response(cache_key, {"summary": final_summary})
         return final_summary
             
+    except TimeoutError as e:
+        logger.error(f"Timeout generating summary: {str(e)}")
+        raise HTTPException(status_code=504, detail="Summary generation timed out. Please try again.")
     except Exception as e:
         logger.error(f"Error generating summary: {str(e)}")
         if isinstance(e, HTTPException):
