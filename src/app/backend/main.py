@@ -1060,7 +1060,7 @@ Answer:"""
         # Get response from LLM
         response = llm.invoke(prompt).content
 
-        return ChatResponse(response=response)
+        return ChatResponse(response=response, user_query=user_query)
     except Exception as e:
         logger.error(f"Error in get_chat_response: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
