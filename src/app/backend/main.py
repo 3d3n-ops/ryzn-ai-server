@@ -1054,6 +1054,7 @@ Remember to:
 2. If the answer cannot be found in the content, say so
 3. Be concise but thorough
 4. Use markdown formatting for better readability
+5. In the event that the user does not upload any content or file, give them a general response but politely remind them to upload a file or content and get help from the assistant.
 
 Answer:"""
 
