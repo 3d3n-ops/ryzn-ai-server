@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # File Upload Settings
     MAX_UPLOAD_SIZE: int = 10 * 1024 * 1024  # 10MB
-    ALLOWED_FILE_TYPES: List[str] = [".pdf", ".txt"]
+    ALLOWED_FILE_TYPES: List[str] = [".pdf", ".txt", ".pptx", ".ppt", ".docx", ".doc"]
 
     # Google Cloud Settings
     GOOGLE_APPLICATION_CREDENTIALS: str = "./credentials/google-credentials.json"

@@ -30,6 +30,10 @@ from .config import Settings, get_settings
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
+# Add imports for PowerPoint and Word documents
+from pptx import Presentation
+import docx
+import io
 
 # Configure logging
 logging.basicConfig(
@@ -725,30 +729,72 @@ async def summarize_file(
     output_type: str = Form("summary")
 ):
     try:
+        # Validate file extension
+        file_extension = os.path.splitext(file.filename.lower())[1]
+        settings = get_settings()
+        
+        logger.debug(f"Processing file: {file.filename} with extension: {file_extension}")
+        
+        if file_extension not in settings.ALLOWED_FILE_TYPES:
+            logger.warning(f"Unsupported file type: {file_extension}. Allowed types: {settings.ALLOWED_FILE_TYPES}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type. Allowed types: {', '.join(settings.ALLOWED_FILE_TYPES)}"
+            )
+            
         # Create a temporary file to store the uploaded content
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             content = await file.read()
             temp_file.write(content)
             temp_file_path = temp_file.name
+            logger.debug(f"Created temporary file at: {temp_file_path}")
 
         try:
             # Extract text based on file type
-            if file.filename.endswith('.pdf'):
+            logger.debug(f"Extracting text from {file_extension} file")
+            
+            if file_extension == '.pdf':
                 text = extract_pdf_text(temp_file_path)
+                logger.debug(f"Extracted {len(text)} characters from PDF")
+            elif file_extension in ['.pptx', '.ppt']:
+                text = extract_pptx_text(temp_file_path)
+                logger.debug(f"Extracted {len(text)} characters from PowerPoint")
+            elif file_extension in ['.docx', '.doc']:
+                text = extract_docx_text(temp_file_path)
+                logger.debug(f"Extracted {len(text)} characters from Word document")
             else:
                 # For text files, read directly
-                with open(temp_file_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
+                try:
+                    with open(temp_file_path, 'r', encoding='utf-8') as f:
+                        text = f.read()
+                    logger.debug(f"Extracted {len(text)} characters from text file using UTF-8")
+                except UnicodeDecodeError:
+                    # Try a different encoding if UTF-8 fails
+                    logger.warning("UTF-8 decoding failed, trying latin-1 encoding")
+                    with open(temp_file_path, 'r', encoding='latin-1') as f:
+                        text = f.read()
+                    logger.debug(f"Extracted {len(text)} characters from text file using latin-1")
+
+            # Check if we got any text content
+            if not text or len(text.strip()) == 0:
+                logger.warning(f"No text could be extracted from {file.filename}")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not extract any text from the provided file."
+                )
 
             # Generate summary or quiz based on output type
+            logger.debug(f"Generating {output_type} from extracted text")
             if output_type == "quiz":
                 result = generate_quiz(text)
             else:
                 result = generate_summary(text)
 
             # Generate notes
+            logger.debug("Generating notes from extracted text")
             notes = generate_notes(text)
-
+            
+            logger.debug("Successfully processed file and generated output")
             return {
                 "summary": result if output_type == "summary" else None,
                 "quiz": result if output_type == "quiz" else None,
@@ -757,8 +803,15 @@ async def summarize_file(
 
         finally:
             # Clean up the temporary file
-            os.unlink(temp_file_path)
+            try:
+                os.unlink(temp_file_path)
+                logger.debug(f"Cleaned up temporary file: {temp_file_path}")
+            except Exception as e:
+                logger.error(f"Error cleaning up temporary file: {str(e)}")
 
+    except HTTPException as he:
+        # Re-raise HTTP exceptions
+        raise he
     except Exception as e:
         logger.error(f"Error processing file: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -1065,6 +1118,38 @@ Answer:"""
     except Exception as e:
         logger.error(f"Error in get_chat_response: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# Functions to extract text from PowerPoint and Word documents
+def extract_pptx_text(file_path):
+    """Extract text from PowerPoint file."""
+    try:
+        presentation = Presentation(file_path)
+        text = []
+        
+        for slide in presentation.slides:
+            slide_text = []
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    slide_text.append(shape.text)
+            
+            # Join all text from this slide
+            if slide_text:
+                text.append(" ".join(slide_text))
+        
+        return "\n\n".join(text)
+    except Exception as e:
+        logger.error(f"Error extracting text from PowerPoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to extract text from PowerPoint: {str(e)}")
+
+def extract_docx_text(file_path):
+    """Extract text from Word document."""
+    try:
+        doc = docx.Document(file_path)
+        paragraphs = [paragraph.text for paragraph in doc.paragraphs if paragraph.text.strip()]
+        return "\n".join(paragraphs)
+    except Exception as e:
+        logger.error(f"Error extracting text from Word document: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to extract text from Word document: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
